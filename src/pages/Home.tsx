@@ -189,56 +189,54 @@ export default function Home() {
   // ── CEFR progress ────────────────────────────────────
 
   async function loadCefrProgress() {
-    const levels = ['A1', 'A2', 'B1', 'B2']
+    const levels = ['A1', 'A2', 'B1', 'B2', 'C1']
 
-    const { data: vocabData } = await supabase
-      .from('french_vocab')
-      .select('cefr_level, is_learned')
+    // Use individual count queries to avoid Supabase 1000-row default limit
+    const results: CefrProgress[] = []
 
-    const { data: reviewCards } = await supabase
-      .from('review_cards')
-      .select('source_id, interval_days, card_type')
-      .eq('card_type', 'vocab')
-      .gte('interval_days', 14)
+    for (const level of levels) {
+      // Total words at this level
+      const { count: total } = await supabase
+        .from('french_vocab')
+        .select('*', { count: 'exact', head: true })
+        .eq('cefr_level', level)
 
-    const totalByLevel = new Map<string, number>()
-    const learnedByLevel = new Map<string, number>()
+      // Learned words at this level
+      const { count: learned } = await supabase
+        .from('french_vocab')
+        .select('*', { count: 'exact', head: true })
+        .eq('cefr_level', level)
+        .eq('is_learned', true)
 
-    if (vocabData) {
-      for (const v of vocabData) {
-        const lvl = v.cefr_level ?? 'A1'
-        totalByLevel.set(lvl, (totalByLevel.get(lvl) ?? 0) + 1)
-        if (v.is_learned) {
-          learnedByLevel.set(lvl, (learnedByLevel.get(lvl) ?? 0) + 1)
+      // Mastered: learned words that have a review card with interval >= 14
+      // First get learned vocab ids at this level
+      const { data: learnedVocab } = await supabase
+        .from('review_cards')
+        .select('source_id')
+        .eq('card_type', 'vocab')
+        .gte('interval_days', 14)
+
+      let mastered = 0
+      if (learnedVocab && learnedVocab.length > 0) {
+        const masteredIds = learnedVocab.map(c => c.source_id).filter(Boolean)
+        if (masteredIds.length > 0) {
+          const { count: masteredCount } = await supabase
+            .from('french_vocab')
+            .select('*', { count: 'exact', head: true })
+            .eq('cefr_level', level)
+            .eq('is_learned', true)
+            .in('id', masteredIds)
+          mastered = masteredCount ?? 0
         }
       }
-    }
 
-    // Build set of mastered source_ids
-    const masteredIds = new Set<number>()
-    if (reviewCards) {
-      for (const c of reviewCards) {
-        if (c.source_id != null) masteredIds.add(c.source_id)
-      }
+      results.push({
+        level,
+        total: total ?? 0,
+        learned: learned ?? 0,
+        mastered,
+      })
     }
-
-    // Now count mastered per level: vocab that is_learned AND has mastered review card
-    const masteredByLevel = new Map<string, number>()
-    if (vocabData) {
-      for (const v of vocabData) {
-        if (v.is_learned && masteredIds.has((v as Record<string, unknown>).id as number)) {
-          const lvl = v.cefr_level ?? 'A1'
-          masteredByLevel.set(lvl, (masteredByLevel.get(lvl) ?? 0) + 1)
-        }
-      }
-    }
-
-    const results: CefrProgress[] = levels.map((level) => ({
-      level,
-      total: totalByLevel.get(level) ?? 0,
-      learned: learnedByLevel.get(level) ?? 0,
-      mastered: masteredByLevel.get(level) ?? 0,
-    }))
 
     setCefrProgress(results)
   }
