@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import { format, addDays } from 'date-fns'
 
@@ -30,50 +31,138 @@ interface SourceVocab {
   emoji?: string
 }
 
+interface DistractorVocab {
+  id: number
+  word: string
+  definition: string
+  cefr_level: string | null
+}
+
+interface WrongEntry {
+  card: ReviewCard
+  userAnswer?: string
+  correctAnswer: string
+}
+
 type Phase = 'start' | 'reviewing' | 'summary'
+type QuestionType = 'multiple_choice' | 'self_judge' | 'spelling' | 'fill_blank'
+
+function getStage(intervalDays: number): number {
+  if (intervalDays >= 21) return 3
+  if (intervalDays >= 7) return 2
+  return 1
+}
+
+function getQuestionType(testMode: string, intervalDays: number): QuestionType {
+  const stage = getStage(intervalDays)
+
+  if (testMode === 'fr_to_cn') {
+    if (stage === 1) return 'multiple_choice'
+    if (stage === 2) return 'self_judge'
+    return 'fill_blank'
+  }
+  if (testMode === 'cn_to_fr') {
+    if (stage === 1) return 'multiple_choice'
+    if (stage === 2) return 'spelling'
+    return 'fill_blank'
+  }
+  // listen
+  if (stage === 1) return 'multiple_choice'
+  return 'spelling'
+}
+
+function normalizeForCompare(s: string): string {
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim()
+}
+
+function shuffleArray<T>(arr: T[]): T[] {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
 
 export default function Review() {
+  const navigate = useNavigate()
   const [phase, setPhase] = useState<Phase>('start')
   const [dueCount, setDueCount] = useState(0)
   const [limit, setLimit] = useState(20)
   const [cards, setCards] = useState<ReviewCard[]>([])
   const [currentIndex, setCurrentIndex] = useState(0)
-  const [revealed, setRevealed] = useState(false)
   const [correctCount, setCorrectCount] = useState(0)
   const [wrongCount, setWrongCount] = useState(0)
-  const [wrongList, setWrongList] = useState<ReviewCard[]>([])
+  const [wrongList, setWrongList] = useState<WrongEntry[]>([])
   const [loading, setLoading] = useState(true)
-  const [notesExpanded, setNotesExpanded] = useState(false)
+  const [sessionStarting, setSessionStarting] = useState(false)
+  const [expandedWrongId, setExpandedWrongId] = useState<number | null>(null)
+
+  // New card tracking for summary
+  const newCardIds = useRef<Set<number>>(new Set())
 
   // Cache for source vocab data
   const vocabCache = useRef<Record<number, SourceVocab>>({})
   const [currentVocab, setCurrentVocab] = useState<SourceVocab | null>(null)
 
+  // Distractor pool
+  const distractorPool = useRef<DistractorVocab[]>([])
+
+  // Question state
+  const [choices, setChoices] = useState<string[]>([])
+  const [selectedChoice, setSelectedChoice] = useState<string | null>(null)
+  const [userInput, setUserInput] = useState('')
+  const [answered, setAnswered] = useState(false)
+  const [answerCorrect, setAnswerCorrect] = useState<boolean | null>(null)
+  const [fillBlankSentence, setFillBlankSentence] = useState<string | null>(null)
+  const [fillBlankAnswer, setFillBlankAnswer] = useState<string>('')
+  const [selfJudgeRevealed, setSelfJudgeRevealed] = useState(false)
+
   useEffect(() => {
     loadDueCount()
-    // Preload voices
     speechSynthesis.getVoices()
   }, [])
 
-  // Fetch source vocab when card changes
+  // Fetch source vocab & set up question when card changes
   useEffect(() => {
     if (!cards[currentIndex]) {
       setCurrentVocab(null)
       return
     }
     const card = cards[currentIndex]
-    setNotesExpanded(false)
+    // Reset question state
+    setSelectedChoice(null)
+    setUserInput('')
+    setAnswered(false)
+    setAnswerCorrect(null)
+    setFillBlankSentence(null)
+    setFillBlankAnswer('')
+    setSelfJudgeRevealed(false)
+
     if (card.source_type === 'french_vocab' && card.source_id) {
-      fetchSourceVocab(card.source_id)
+      fetchSourceVocab(card.source_id).then((vocab) => {
+        setupQuestion(card, vocab)
+      })
     } else {
       setCurrentVocab(null)
+      setupQuestion(card, null)
     }
   }, [currentIndex, cards])
 
-  async function fetchSourceVocab(sourceId: number) {
+  // Auto-play TTS for listen mode
+  useEffect(() => {
+    if (!cards[currentIndex]) return
+    const card = cards[currentIndex]
+    if (card.test_mode === 'listen' && !answered) {
+      const timer = setTimeout(() => speak(card.front), 300)
+      return () => clearTimeout(timer)
+    }
+  }, [currentIndex, cards])
+
+  async function fetchSourceVocab(sourceId: number): Promise<SourceVocab | null> {
     if (vocabCache.current[sourceId]) {
       setCurrentVocab(vocabCache.current[sourceId])
-      return
+      return vocabCache.current[sourceId]
     }
     const { data } = await supabase
       .from('french_vocab')
@@ -83,9 +172,88 @@ export default function Review() {
     if (data) {
       vocabCache.current[sourceId] = data
       setCurrentVocab(data)
-    } else {
-      setCurrentVocab(null)
+      return data
     }
+    setCurrentVocab(null)
+    return null
+  }
+
+  function setupQuestion(card: ReviewCard, vocab: SourceVocab | null) {
+    const qType = getQuestionType(card.test_mode, card.interval_days)
+
+    if (qType === 'multiple_choice') {
+      generateChoices(card, vocab)
+    } else if (qType === 'fill_blank') {
+      setupFillBlank(card, vocab)
+    }
+  }
+
+  function generateChoices(card: ReviewCard, vocab: SourceVocab | null) {
+    const mode = card.test_mode
+    const pool = distractorPool.current
+
+    if (mode === 'fr_to_cn') {
+      // Correct answer is definition
+      const correctDef = vocab?.definition || card.back || ''
+      // Get distractors: prefer same cefr_level
+      const sameLevelPool = pool.filter(d => d.cefr_level === card.cefr_level && d.definition !== correctDef && d.id !== card.source_id)
+      const otherPool = pool.filter(d => d.cefr_level !== card.cefr_level && d.definition !== correctDef && d.id !== card.source_id)
+      const candidates = sameLevelPool.length >= 3
+        ? shuffleArray(sameLevelPool).slice(0, 3)
+        : [...shuffleArray(sameLevelPool), ...shuffleArray(otherPool)].slice(0, 3)
+      const distractorDefs = candidates.map(c => c.definition)
+      setChoices(shuffleArray([correctDef, ...distractorDefs]))
+    } else {
+      // cn_to_fr or listen: 4 French word options
+      const correctWord = card.front
+      let preferred: DistractorVocab[]
+      if (mode === 'listen') {
+        // Prefer same first letter
+        const firstLetter = correctWord[0]?.toLowerCase()
+        preferred = pool.filter(d => d.word !== correctWord && d.id !== card.source_id && d.word[0]?.toLowerCase() === firstLetter)
+      } else {
+        // Prefer same cefr_level and similar length
+        preferred = pool.filter(d => d.word !== correctWord && d.id !== card.source_id && d.cefr_level === card.cefr_level)
+        preferred.sort((a, b) => Math.abs(a.word.length - correctWord.length) - Math.abs(b.word.length - correctWord.length))
+      }
+      const fallback = pool.filter(d => d.word !== correctWord && d.id !== card.source_id && !preferred.includes(d))
+      const candidates = preferred.length >= 3
+        ? (mode === 'listen' ? shuffleArray(preferred).slice(0, 3) : preferred.slice(0, 3))
+        : [...(mode === 'listen' ? shuffleArray(preferred) : preferred), ...shuffleArray(fallback)].slice(0, 3)
+      setChoices(shuffleArray([correctWord, ...candidates.map(c => c.word)]))
+    }
+  }
+
+  function setupFillBlank(card: ReviewCard, vocab: SourceVocab | null) {
+    // Try to get an example sentence
+    if (vocab?.example_sentences) {
+      try {
+        const sentences = typeof vocab.example_sentences === 'string'
+          ? JSON.parse(vocab.example_sentences)
+          : vocab.example_sentences
+        if (Array.isArray(sentences) && sentences.length > 0) {
+          const sentence = sentences[Math.floor(Math.random() * sentences.length)]
+          const frSentence: string = sentence.fr || sentence.french || ''
+          if (frSentence) {
+            // Replace the target word with blank (case-insensitive)
+            const word = card.front
+            const regex = new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi')
+            if (regex.test(frSentence)) {
+              const hint = word[0] + '____'
+              const blanked = frSentence.replace(regex, hint)
+              setFillBlankSentence(blanked)
+              setFillBlankAnswer(word)
+              return
+            }
+          }
+        }
+      } catch {
+        // fall through
+      }
+    }
+    // No example sentences -> fall back to stage 2 format (self_judge for fr_to_cn, spelling for cn_to_fr)
+    setFillBlankSentence(null)
+    setFillBlankAnswer('')
   }
 
   async function loadDueCount() {
@@ -101,7 +269,6 @@ export default function Review() {
 
   async function detectUserLevel(): Promise<string> {
     const levels = ['A1', 'A2', 'B1', 'B2', 'C1']
-    // Count mastered (interval >= 14) per level from tcf_vocab_target
     const { data: target } = await supabase
       .from('tcf_vocab_target')
       .select('cefr_level, is_learned')
@@ -130,9 +297,24 @@ export default function Review() {
     return currentLevel
   }
 
+  async function fetchDistractorPool() {
+    const { data } = await supabase
+      .from('french_vocab')
+      .select('id, word, definition, cefr_level')
+      .not('definition', 'is', null)
+      .limit(200)
+    if (data) {
+      distractorPool.current = shuffleArray(data as DistractorVocab[])
+    }
+  }
+
   async function startSession() {
+    setSessionStarting(true)
     const now = new Date().toISOString()
     const allCards: ReviewCard[] = []
+
+    // Fetch distractor pool in parallel with cards
+    await fetchDistractorPool()
 
     // === Tier 1: Due review cards ===
     const { data: dueCards } = await supabase
@@ -144,11 +326,9 @@ export default function Review() {
 
     if (dueCards) allCards.push(...dueCards)
 
-    // If we already have enough, start
     if (allCards.length >= limit) {
       allCards.splice(limit)
     } else {
-      // === Fill remaining with Tier 2 (75%) + Tier 3 (25%) new words ===
       const remaining = limit - allCards.length
       const tier2Count = Math.round(remaining * 0.75)
       const tier3Count = remaining - tier2Count
@@ -156,14 +336,13 @@ export default function Review() {
       const userLevel = await detectUserLevel()
       const existingSourceIds = new Set(allCards.filter(c => c.source_id).map(c => c.source_id))
 
-      // Get IDs of words that already have review cards
       const { data: existingCards } = await supabase
         .from('review_cards')
         .select('source_id')
         .eq('source_type', 'french_vocab')
       const hasCardIds = new Set((existingCards || []).map(c => c.source_id))
 
-      // Tier 2: Same-level new words from french_vocab
+      // Tier 2: Same-level new words
       if (tier2Count > 0) {
         let query = supabase
           .from('french_vocab')
@@ -172,16 +351,14 @@ export default function Review() {
         if (userLevel) {
           query = query.eq('cefr_level', userLevel)
         }
-        const { data: sameLevel } = await query.limit(tier2Count * 3) // fetch extra to randomize
+        const { data: sameLevel } = await query.limit(tier2Count * 3)
 
         if (sameLevel && sameLevel.length > 0) {
-          // Shuffle and pick
           const shuffled = sameLevel.sort(() => Math.random() - 0.5)
           const picked = shuffled.filter(v => !hasCardIds.has(v.id)).slice(0, tier2Count)
 
           for (const vocab of picked) {
             if (existingSourceIds.has(vocab.id)) continue
-            // Create a new review card on the fly
             const newCard = await createCardFromVocab(vocab)
             if (newCard) {
               allCards.push(newCard)
@@ -197,7 +374,6 @@ export default function Review() {
         const userIdx = levels.indexOf(userLevel)
         const aboveLevels = levels.slice(userIdx + 1)
 
-        // Distribution weights
         const weights: Record<string, number> = {}
         if (aboveLevels.length === 1) {
           weights[aboveLevels[0]] = 1
@@ -243,16 +419,18 @@ export default function Review() {
     }
 
     if (allCards.length > 0) {
+      const finalCards = allCards.slice(0, limit)
+      // Track new cards (repetitions === 0)
+      newCardIds.current = new Set(finalCards.filter(c => c.repetitions === 0).map(c => c.id))
       vocabCache.current = {}
-      setCards(allCards.slice(0, limit))
+      setCards(finalCards)
       setCurrentIndex(0)
-      setRevealed(false)
       setCorrectCount(0)
       setWrongCount(0)
       setWrongList([])
-      setNotesExpanded(false)
       setPhase('reviewing')
     }
+    setSessionStarting(false)
   }
 
   async function createCardFromVocab(vocab: Record<string, unknown>): Promise<ReviewCard | null> {
@@ -290,26 +468,22 @@ export default function Review() {
     return rotation[(idx + 1) % rotation.length]
   }
 
-  const advanceCard = useCallback(async (correct: boolean) => {
+  const advanceCard = useCallback(async (correct: boolean, userAnswer?: string) => {
     if (!currentCard) return
 
     const ef = currentCard.easiness_factor
     let newEf: number
     let newInterval: number
     let newReps: number
-    let newStage = currentCard.current_stage
 
     if (correct) {
       newEf = Math.min(2.5, ef + 0.1)
-      newInterval = Math.max(1, Math.round(currentCard.interval_days * ef))
+      newInterval = currentCard.repetitions === 0 ? 1 : Math.max(1, Math.round(currentCard.interval_days * ef))
       newReps = currentCard.repetitions + 1
-      if (newInterval > 21) newStage = 3
-      else if (newInterval > 7) newStage = 2
     } else {
       newEf = Math.max(1.3, ef - 0.2)
       newInterval = 1
       newReps = 0
-      newStage = 1
     }
 
     const now = new Date()
@@ -324,7 +498,6 @@ export default function Review() {
         next_review: nextReview.toISOString(),
         last_reviewed: now.toISOString(),
         test_mode: getNextTestMode(currentCard.test_mode),
-        current_stage: newStage,
       })
       .eq('id', currentCard.id)
 
@@ -332,20 +505,27 @@ export default function Review() {
       setCorrectCount((c) => c + 1)
     } else {
       setWrongCount((c) => c + 1)
-      setWrongList((prev) => [...prev, currentCard])
+      const correctAns = getCorrectAnswerForCard(currentCard)
+      setWrongList((prev) => [...prev, { card: currentCard, userAnswer, correctAnswer: correctAns }])
     }
 
     if (currentIndex + 1 >= cards.length) {
-      // Session complete - update study_stats
       const todayCorrect = correct ? correctCount + 1 : correctCount
       const todayWrong = correct ? wrongCount : wrongCount + 1
       await updateStudyStats(cards.length, todayCorrect, todayWrong)
       setPhase('summary')
     } else {
       setCurrentIndex((i) => i + 1)
-      setRevealed(false)
     }
   }, [currentCard, currentIndex, cards.length, correctCount, wrongCount])
+
+  function getCorrectAnswerForCard(card: ReviewCard): string {
+    const mode = card.test_mode
+    if (mode === 'fr_to_cn') {
+      return currentVocab?.definition || card.back || ''
+    }
+    return card.front
+  }
 
   async function updateStudyStats(total: number, correct: number, wrong: number) {
     const today = format(new Date(), 'yyyy-MM-dd')
@@ -366,7 +546,6 @@ export default function Review() {
         })
         .eq('id', existing.id)
     } else {
-      // Calculate streak
       const { data: allStats } = await supabase
         .from('study_stats')
         .select('date, streak_days')
@@ -420,39 +599,96 @@ export default function Review() {
     )
   }
 
-  // Get the phonetic/IPA to display: prefer source vocab IPA, fall back to card phonetic
   function getPhonetic(): string | null {
     if (currentVocab?.ipa) return currentVocab.ipa
     if (currentCard?.phonetic) return currentCard.phonetic
     return null
   }
 
-  // Get definition: prefer source vocab definition, fall back to card back
   function getDefinition(): string {
     if (currentVocab?.definition) return currentVocab.definition
     return currentCard?.back ?? ''
   }
 
-  // Get notes content
   function getNotes(): string | null {
     if (currentVocab?.notes) return currentVocab.notes
-    // If the definition came from source vocab, the card's back might have extra info
     if (currentVocab?.definition && currentCard?.back && currentCard.back !== currentVocab.definition) {
       return currentCard.back
     }
     return null
   }
 
-  // Get emoji from source vocab or card
   function getEmoji(): string | null {
     if (currentVocab?.emoji) return currentVocab.emoji
     if (currentCard?.emoji) return currentCard.emoji
     return null
   }
 
-  function renderFront() {
+  function getCnPrompt(): string {
+    const emoji = getEmoji()
+    if (emoji) return emoji
+    const def = getDefinition()
+    if (def) return def
+    return getNotes() || ''
+  }
+
+  // Handle multiple choice selection
+  function handleChoiceSelect(choice: string) {
+    if (answered) return
+    setSelectedChoice(choice)
+    setAnswered(true)
+
+    const mode = currentCard?.test_mode
+    let correct: boolean
+    if (mode === 'fr_to_cn') {
+      const correctDef = currentVocab?.definition || currentCard?.back || ''
+      correct = choice === correctDef
+    } else {
+      correct = choice === currentCard?.front
+    }
+    setAnswerCorrect(correct)
+
+    // Auto-advance after delay
+    setTimeout(() => {
+      advanceCard(correct, choice)
+    }, 1200)
+  }
+
+  // Handle spelling submit
+  function handleSpellingSubmit() {
+    if (answered || !currentCard) return
+    setAnswered(true)
+    const correct = normalizeForCompare(userInput) === normalizeForCompare(currentCard.front)
+    setAnswerCorrect(correct)
+
+    setTimeout(() => {
+      advanceCard(correct, userInput)
+    }, 1500)
+  }
+
+  // Handle fill-in-blank submit
+  function handleFillBlankSubmit() {
+    if (answered || !currentCard) return
+    setAnswered(true)
+    const target = fillBlankAnswer || currentCard.front
+    const correct = normalizeForCompare(userInput) === normalizeForCompare(target)
+    setAnswerCorrect(correct)
+
+    setTimeout(() => {
+      advanceCard(correct, userInput)
+    }, 1500)
+  }
+
+  // Handle self-judge reveal
+  function handleSelfJudgeReveal() {
+    setSelfJudgeRevealed(true)
+  }
+
+  // Render the question prompt (top part of card)
+  function renderPrompt() {
     if (!currentCard) return null
     const mode = currentCard.test_mode
+    const qType = getQuestionType(mode, currentCard.interval_days)
 
     if (mode === 'listen') {
       return (
@@ -463,26 +699,34 @@ export default function Review() {
           >
             🔊
           </button>
-          <div className="text-sm text-gray-400">点击听发音，猜词义</div>
+          <div className="text-sm text-gray-400">听发音，选择正确答案</div>
         </div>
       )
     }
 
     if (mode === 'cn_to_fr') {
-      const emoji = getEmoji()
+      const prompt = getCnPrompt()
+      const isEmoji = getEmoji() === prompt
       return (
         <div className="text-center">
           <div className="text-sm text-gray-400 mb-2">中 → 法</div>
-          {emoji ? (
-            <div className="text-4xl">{emoji}</div>
-          ) : (
-            <div className="text-2xl font-bold text-gray-800">{currentCard.back}</div>
-          )}
+          <div className={isEmoji ? 'text-4xl' : 'text-2xl font-bold text-gray-800'}>
+            {prompt}
+          </div>
         </div>
       )
     }
 
-    // fr_to_cn (default)
+    // fr_to_cn
+    if (qType === 'fill_blank' && fillBlankSentence) {
+      return (
+        <div className="text-center">
+          <div className="text-sm text-gray-400 mb-2">填空</div>
+          <div className="text-lg text-gray-800 leading-relaxed">{fillBlankSentence}</div>
+        </div>
+      )
+    }
+
     const phonetic = getPhonetic()
     return (
       <div className="text-center">
@@ -499,86 +743,196 @@ export default function Review() {
     )
   }
 
-  function renderNotesSection(notes: string | null, definition: string) {
-    // If there's no definition but there are notes, show notes expanded
-    const hasDefinition = !!definition
-    const hasNotes = !!notes
-    if (!hasNotes) return null
-
-    const shouldDefaultExpand = !hasDefinition
-    const isExpanded = shouldDefaultExpand || notesExpanded
-
-    return (
-      <div className="mt-3 w-full">
-        {!shouldDefaultExpand && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              setNotesExpanded(!notesExpanded)
-            }}
-            className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
-          >
-            {notesExpanded ? '收起备注 ▲' : '展开备注 ▼'}
-          </button>
-        )}
-        {isExpanded && (
-          <div className="mt-1 text-sm text-gray-500 bg-gray-100 rounded-lg px-3 py-2 text-left whitespace-pre-wrap">
-            {notes}
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  function renderBack() {
+  // Render the interaction area (choices, input, etc.)
+  function renderInteraction() {
     if (!currentCard) return null
     const mode = currentCard.test_mode
-    const phonetic = getPhonetic()
-    const definition = getDefinition()
-    const notes = getNotes()
+    const qType = getQuestionType(mode, currentCard.interval_days)
 
-    if (mode === 'cn_to_fr') {
-      return (
-        <div className="text-center mt-4 pt-4 border-t border-gray-100 w-full">
-          {getEmoji() && <div className="text-2xl mb-1">{getEmoji()}</div>}
-          <div className="flex items-center justify-center">
-            <span className="text-2xl font-bold text-indigo-600">{currentCard.front}</span>
-            <SpeakButton text={currentCard.front} />
-          </div>
-          {phonetic && (
-            <div className="text-sm text-gray-400 mt-1">{phonetic}</div>
-          )}
-          <div className="text-base text-gray-600 mt-2">{definition}</div>
-          {renderNotesSection(notes, definition)}
-        </div>
-      )
+    // Fill-in-blank with no sentence falls back
+    const effectiveQType = (qType === 'fill_blank' && !fillBlankSentence)
+      ? (mode === 'fr_to_cn' ? 'self_judge' : 'spelling')
+      : qType
+
+    switch (effectiveQType) {
+      case 'multiple_choice':
+        return renderMultipleChoice()
+      case 'self_judge':
+        return renderSelfJudge()
+      case 'spelling':
+        return renderSpelling()
+      case 'fill_blank':
+        return renderFillBlank()
+      default:
+        return null
     }
+  }
 
-    if (mode === 'listen') {
-      return (
-        <div className="text-center mt-4 pt-4 border-t border-gray-100 w-full">
-          {getEmoji() && <div className="text-2xl mb-1">{getEmoji()}</div>}
-          <div className="flex items-center justify-center">
-            <span className="text-2xl font-bold text-indigo-600">{currentCard.front}</span>
-            <SpeakButton text={currentCard.front} />
-          </div>
-          {phonetic && (
-            <div className="text-sm text-gray-400 mt-1">{phonetic}</div>
-          )}
-          <div className="text-base text-gray-600 mt-2">{definition}</div>
-          {renderNotesSection(notes, definition)}
-        </div>
-      )
-    }
-
-    // fr_to_cn
+  function renderMultipleChoice() {
     return (
-      <div className="text-center mt-4 pt-4 border-t border-gray-100 w-full">
-        <div className="text-xl font-bold text-indigo-600">{definition}</div>
-        {renderNotesSection(notes, definition)}
+      <div className="mt-6 space-y-3 w-full">
+        {choices.map((choice, i) => {
+          let bg = 'bg-white border border-gray-200 active:bg-gray-50'
+          if (answered && selectedChoice !== null) {
+            const mode = currentCard?.test_mode
+            const correctAnswer = mode === 'fr_to_cn'
+              ? (currentVocab?.definition || currentCard?.back || '')
+              : currentCard?.front || ''
+
+            if (choice === correctAnswer) {
+              bg = 'bg-green-100 border border-green-400 text-green-800'
+            } else if (choice === selectedChoice && choice !== correctAnswer) {
+              bg = 'bg-red-100 border border-red-400 text-red-800'
+            } else {
+              bg = 'bg-white border border-gray-100 opacity-50'
+            }
+          }
+
+          return (
+            <button
+              key={i}
+              onClick={() => handleChoiceSelect(choice)}
+              disabled={answered}
+              className={`w-full text-left px-4 py-3 rounded-xl text-base transition-colors ${bg}`}
+            >
+              {choice}
+            </button>
+          )
+        })}
       </div>
     )
   }
+
+  function renderSelfJudge() {
+    if (!currentCard) return null
+    const phonetic = getPhonetic()
+    const definition = getDefinition()
+
+    if (!selfJudgeRevealed) {
+      return (
+        <div className="mt-6 w-full">
+          <div className="text-sm text-gray-400 mb-2">输入你认为的意思</div>
+          <input
+            type="text"
+            value={userInput}
+            onChange={(e) => setUserInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleSelfJudgeReveal() }}
+            className="w-full border border-gray-200 rounded-xl px-4 py-3 text-base focus:outline-none focus:border-indigo-400"
+            placeholder="输入意思..."
+            autoFocus
+          />
+          <button
+            onClick={handleSelfJudgeReveal}
+            className="w-full mt-3 bg-indigo-600 text-white rounded-xl py-3 font-medium active:bg-indigo-700 transition-colors"
+          >
+            查看答案
+          </button>
+        </div>
+      )
+    }
+
+    // Revealed: show answer and judge buttons
+    return (
+      <div className="mt-6 w-full">
+        <div className="bg-gray-50 rounded-xl p-4 mb-4 text-center">
+          {phonetic && <div className="text-sm text-gray-400 mb-1">{phonetic}</div>}
+          <div className="text-xl font-bold text-indigo-600 mb-2">{definition}</div>
+          {userInput && (
+            <div className="text-sm text-gray-500">
+              你的回答: <span className="font-medium text-gray-700">{userInput}</span>
+            </div>
+          )}
+        </div>
+        <div className="flex gap-3">
+          <button
+            onClick={() => advanceCard(false, userInput)}
+            className="flex-1 bg-red-50 text-red-600 rounded-xl py-3 font-medium active:bg-red-100 transition-colors text-lg"
+          >
+            ❌ 错了
+          </button>
+          <button
+            onClick={() => advanceCard(true, userInput)}
+            className="flex-1 bg-green-50 text-green-600 rounded-xl py-3 font-medium active:bg-green-100 transition-colors text-lg"
+          >
+            ✅ 对了
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  function renderSpelling() {
+    if (!currentCard) return null
+
+    return (
+      <div className="mt-6 w-full">
+        <div className="text-sm text-gray-400 mb-2">拼写法语单词</div>
+        <input
+          type="text"
+          value={userInput}
+          onChange={(e) => setUserInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') handleSpellingSubmit() }}
+          disabled={answered}
+          className="w-full border border-gray-200 rounded-xl px-4 py-3 text-base focus:outline-none focus:border-indigo-400"
+          placeholder="输入法语单词..."
+          autoFocus
+          autoCapitalize="off"
+          autoCorrect="off"
+        />
+        {!answered && (
+          <button
+            onClick={handleSpellingSubmit}
+            className="w-full mt-3 bg-indigo-600 text-white rounded-xl py-3 font-medium active:bg-indigo-700 transition-colors"
+          >
+            确认
+          </button>
+        )}
+        {answered && (
+          <div className={`mt-3 text-center text-lg font-medium ${answerCorrect ? 'text-green-600' : 'text-red-600'}`}>
+            {answerCorrect ? '正确!' : `incorrect, correct answer is: ${currentCard.front}`}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function renderFillBlank() {
+    if (!currentCard) return null
+    const target = fillBlankAnswer || currentCard.front
+
+    return (
+      <div className="mt-6 w-full">
+        <div className="text-sm text-gray-400 mb-2">填入缺失的法语单词</div>
+        <input
+          type="text"
+          value={userInput}
+          onChange={(e) => setUserInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') handleFillBlankSubmit() }}
+          disabled={answered}
+          className="w-full border border-gray-200 rounded-xl px-4 py-3 text-base focus:outline-none focus:border-indigo-400"
+          placeholder="输入单词..."
+          autoFocus
+          autoCapitalize="off"
+          autoCorrect="off"
+        />
+        {!answered && (
+          <button
+            onClick={handleFillBlankSubmit}
+            className="w-full mt-3 bg-indigo-600 text-white rounded-xl py-3 font-medium active:bg-indigo-700 transition-colors"
+          >
+            确认
+          </button>
+        )}
+        {answered && (
+          <div className={`mt-3 text-center text-lg font-medium ${answerCorrect ? 'text-green-600' : 'text-red-600'}`}>
+            {answerCorrect ? '正确!' : `incorrect, correct answer is: ${target}`}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // ============ RENDER PHASES ============
 
   // START SCREEN
   if (phase === 'start') {
@@ -619,9 +973,10 @@ export default function Review() {
         </div>
         <button
           onClick={startSession}
-          className="bg-indigo-600 text-white rounded-xl px-8 py-3 text-lg font-medium active:bg-indigo-700 transition-colors mb-6"
+          disabled={sessionStarting}
+          className="bg-indigo-600 text-white rounded-xl px-8 py-3 text-lg font-medium active:bg-indigo-700 transition-colors mb-6 disabled:opacity-50"
         >
-          开始复习
+          {sessionStarting ? '准备中...' : '开始复习'}
         </button>
 
         {dueCount === 0 && (
@@ -637,6 +992,7 @@ export default function Review() {
   if (phase === 'summary') {
     const total = correctCount + wrongCount
     const accuracy = total > 0 ? Math.round((correctCount / total) * 100) : 0
+    const newWordsCount = newCardIds.current.size
 
     return (
       <div className="px-4 pt-8">
@@ -646,18 +1002,22 @@ export default function Review() {
           <div className="text-sm text-gray-500">正确率 {accuracy}%</div>
         </div>
 
-        <div className="flex gap-3 mb-6">
-          <div className="flex-1 bg-green-50 rounded-xl p-4 text-center">
-            <div className="text-2xl font-bold text-green-600">{correctCount}</div>
-            <div className="text-xs text-gray-500 mt-1">正确</div>
+        <div className="grid grid-cols-4 gap-2 mb-6">
+          <div className="bg-indigo-50 rounded-xl p-3 text-center">
+            <div className="text-xl font-bold text-indigo-600">{total}</div>
+            <div className="text-[10px] text-gray-500 mt-1">总计</div>
           </div>
-          <div className="flex-1 bg-red-50 rounded-xl p-4 text-center">
-            <div className="text-2xl font-bold text-red-500">{wrongCount}</div>
-            <div className="text-xs text-gray-500 mt-1">错误</div>
+          <div className="bg-green-50 rounded-xl p-3 text-center">
+            <div className="text-xl font-bold text-green-600">{correctCount}</div>
+            <div className="text-[10px] text-gray-500 mt-1">正确 ({total > 0 ? Math.round((correctCount / total) * 100) : 0}%)</div>
           </div>
-          <div className="flex-1 bg-indigo-50 rounded-xl p-4 text-center">
-            <div className="text-2xl font-bold text-indigo-600">{total}</div>
-            <div className="text-xs text-gray-500 mt-1">总计</div>
+          <div className="bg-red-50 rounded-xl p-3 text-center">
+            <div className="text-xl font-bold text-red-500">{wrongCount}</div>
+            <div className="text-[10px] text-gray-500 mt-1">错误 ({total > 0 ? Math.round((wrongCount / total) * 100) : 0}%)</div>
+          </div>
+          <div className="bg-purple-50 rounded-xl p-3 text-center">
+            <div className="text-xl font-bold text-purple-600">{newWordsCount}</div>
+            <div className="text-[10px] text-gray-500 mt-1">新词</div>
           </div>
         </div>
 
@@ -665,25 +1025,61 @@ export default function Review() {
           <div className="mb-6">
             <h3 className="text-sm font-semibold text-gray-600 mb-2">错误列表</h3>
             <div className="space-y-2">
-              {wrongList.map((card) => (
-                <div key={card.id} className="bg-red-50 rounded-lg px-3 py-2">
-                  <div className="text-sm font-medium text-gray-800">{card.front}</div>
-                  <div className="text-xs text-gray-500">{card.back}</div>
-                </div>
-              ))}
+              {wrongList.map((entry) => {
+                const isExpanded = expandedWrongId === entry.card.id
+                return (
+                  <div key={entry.card.id} className="bg-red-50 rounded-lg overflow-hidden">
+                    <button
+                      onClick={() => setExpandedWrongId(isExpanded ? null : entry.card.id)}
+                      className="w-full text-left px-3 py-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <span className="text-sm font-medium text-gray-800">{entry.card.front}</span>
+                          <span className="text-xs text-gray-400 ml-2">→ {entry.correctAnswer}</span>
+                        </div>
+                        <span className="text-xs text-gray-400">{isExpanded ? '▲' : '▼'}</span>
+                      </div>
+                      {entry.userAnswer && (
+                        <div className="text-xs text-red-500 mt-0.5">你的回答: {entry.userAnswer}</div>
+                      )}
+                    </button>
+                    {isExpanded && (
+                      <div className="px-3 pb-2 text-xs text-gray-500 border-t border-red-100 pt-2 space-y-1">
+                        <div>法语: {entry.card.front}</div>
+                        <div>释义: {entry.correctAnswer}</div>
+                        {entry.card.phonetic && <div>音标: {entry.card.phonetic}</div>}
+                        {entry.card.cefr_level && <div>级别: {entry.card.cefr_level}</div>}
+                        {entry.card.emoji && <div>Emoji: {entry.card.emoji}</div>}
+                        <div>测试模式: {entry.card.test_mode}</div>
+                        <div>间隔: {entry.card.interval_days} 天</div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </div>
         )}
 
-        <button
-          onClick={() => {
-            setPhase('start')
-            loadDueCount()
-          }}
-          className="w-full bg-indigo-600 text-white rounded-xl py-3 font-medium active:bg-indigo-700 transition-colors"
-        >
-          返回
-        </button>
+        <div className="flex gap-3 mb-6">
+          <button
+            onClick={() => {
+              setPhase('start')
+              loadDueCount()
+              startSession()
+            }}
+            className="flex-1 bg-indigo-100 text-indigo-700 rounded-xl py-3 font-medium active:bg-indigo-200 transition-colors"
+          >
+            再来一轮
+          </button>
+          <button
+            onClick={() => navigate('/')}
+            className="flex-1 bg-gray-100 text-gray-700 rounded-xl py-3 font-medium active:bg-gray-200 transition-colors"
+          >
+            回到主页
+          </button>
+        </div>
       </div>
     )
   }
@@ -704,12 +1100,17 @@ export default function Review() {
         </span>
       </div>
 
-      {/* Card type badge */}
+      {/* Card type & level badges */}
       {currentCard && (
         <div className="flex justify-between items-center mb-4">
-          <span className="text-[10px] bg-gray-100 text-gray-500 rounded px-1.5 py-0.5">
-            {currentCard.card_type === 'vocab' ? '词汇' : '语法'}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] bg-gray-100 text-gray-500 rounded px-1.5 py-0.5">
+              {currentCard.card_type === 'vocab' ? '词汇' : '语法'}
+            </span>
+            <span className="text-[10px] bg-indigo-50 text-indigo-400 rounded px-1.5 py-0.5">
+              {currentCard.test_mode === 'fr_to_cn' ? '法→中' : currentCard.test_mode === 'cn_to_fr' ? '中→法' : '听力'}
+            </span>
+          </div>
           {currentCard.cefr_level && (
             <span className="text-[10px] bg-indigo-50 text-indigo-500 rounded px-1.5 py-0.5">
               {currentCard.cefr_level}
@@ -720,34 +1121,9 @@ export default function Review() {
 
       {/* Card */}
       <div className="bg-gray-50 rounded-2xl p-6 min-h-[200px] flex flex-col items-center justify-center mb-6">
-        {renderFront()}
-        {revealed && renderBack()}
+        {renderPrompt()}
+        {renderInteraction()}
       </div>
-
-      {/* Action buttons */}
-      {!revealed ? (
-        <button
-          onClick={() => setRevealed(true)}
-          className="w-full bg-gray-100 text-gray-700 rounded-xl py-3 font-medium active:bg-gray-200 transition-colors"
-        >
-          显示答案
-        </button>
-      ) : (
-        <div className="flex gap-3">
-          <button
-            onClick={() => advanceCard(false)}
-            className="flex-1 bg-red-50 text-red-600 rounded-xl py-3 font-medium active:bg-red-100 transition-colors"
-          >
-            错了 ✗
-          </button>
-          <button
-            onClick={() => advanceCard(true)}
-            className="flex-1 bg-green-50 text-green-600 rounded-xl py-3 font-medium active:bg-green-100 transition-colors"
-          >
-            对了 ✓
-          </button>
-        </div>
-      )}
     </div>
   )
 }
