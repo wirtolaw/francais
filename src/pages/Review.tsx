@@ -99,18 +99,152 @@ export default function Review() {
     setLoading(false)
   }
 
+  async function detectUserLevel(): Promise<string> {
+    const levels = ['A1', 'A2', 'B1', 'B2', 'C1']
+    // Count mastered (interval >= 14) per level from tcf_vocab_target
+    const { data: target } = await supabase
+      .from('tcf_vocab_target')
+      .select('cefr_level, is_learned')
+
+    if (!target) return 'A1'
+
+    const totalByLevel: Record<string, number> = {}
+    const learnedByLevel: Record<string, number> = {}
+    for (const t of target) {
+      const lvl = t.cefr_level || 'A1'
+      totalByLevel[lvl] = (totalByLevel[lvl] || 0) + 1
+      if (t.is_learned) learnedByLevel[lvl] = (learnedByLevel[lvl] || 0) + 1
+    }
+
+    let currentLevel = 'A1'
+    for (const lvl of levels) {
+      const total = totalByLevel[lvl] || 0
+      const learned = learnedByLevel[lvl] || 0
+      if (total > 0 && learned / total >= 0.7) {
+        const nextIdx = levels.indexOf(lvl) + 1
+        if (nextIdx < levels.length) currentLevel = levels[nextIdx]
+      } else {
+        break
+      }
+    }
+    return currentLevel
+  }
+
   async function startSession() {
     const now = new Date().toISOString()
-    const { data } = await supabase
+    const allCards: ReviewCard[] = []
+
+    // === Tier 1: Due review cards ===
+    const { data: dueCards } = await supabase
       .from('review_cards')
       .select('*')
       .or(`next_review.is.null,next_review.lte.${now}`)
       .order('next_review', { ascending: true, nullsFirst: true })
       .limit(limit)
 
-    if (data && data.length > 0) {
+    if (dueCards) allCards.push(...dueCards)
+
+    // If we already have enough, start
+    if (allCards.length >= limit) {
+      allCards.splice(limit)
+    } else {
+      // === Fill remaining with Tier 2 (75%) + Tier 3 (25%) new words ===
+      const remaining = limit - allCards.length
+      const tier2Count = Math.round(remaining * 0.75)
+      const tier3Count = remaining - tier2Count
+
+      const userLevel = await detectUserLevel()
+      const existingSourceIds = new Set(allCards.filter(c => c.source_id).map(c => c.source_id))
+
+      // Get IDs of words that already have review cards
+      const { data: existingCards } = await supabase
+        .from('review_cards')
+        .select('source_id')
+        .eq('source_type', 'french_vocab')
+      const hasCardIds = new Set((existingCards || []).map(c => c.source_id))
+
+      // Tier 2: Same-level new words from french_vocab
+      if (tier2Count > 0) {
+        let query = supabase
+          .from('french_vocab')
+          .select('*')
+          .eq('is_learned', false)
+        if (userLevel) {
+          query = query.eq('cefr_level', userLevel)
+        }
+        const { data: sameLevel } = await query.limit(tier2Count * 3) // fetch extra to randomize
+
+        if (sameLevel && sameLevel.length > 0) {
+          // Shuffle and pick
+          const shuffled = sameLevel.sort(() => Math.random() - 0.5)
+          const picked = shuffled.filter(v => !hasCardIds.has(v.id)).slice(0, tier2Count)
+
+          for (const vocab of picked) {
+            if (existingSourceIds.has(vocab.id)) continue
+            // Create a new review card on the fly
+            const newCard = await createCardFromVocab(vocab)
+            if (newCard) {
+              allCards.push(newCard)
+              existingSourceIds.add(vocab.id)
+            }
+          }
+        }
+      }
+
+      // Tier 3: Above-level words
+      if (tier3Count > 0) {
+        const levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+        const userIdx = levels.indexOf(userLevel)
+        const aboveLevels = levels.slice(userIdx + 1)
+
+        // Distribution weights
+        const weights: Record<string, number> = {}
+        if (aboveLevels.length === 1) {
+          weights[aboveLevels[0]] = 1
+        } else if (aboveLevels.length === 2) {
+          weights[aboveLevels[0]] = 0.6
+          weights[aboveLevels[1]] = 0.4
+        } else if (aboveLevels.length === 3) {
+          weights[aboveLevels[0]] = 0.5
+          weights[aboveLevels[1]] = 0.35
+          weights[aboveLevels[2]] = 0.15
+        } else if (aboveLevels.length >= 4) {
+          weights[aboveLevels[0]] = 0.4
+          weights[aboveLevels[1]] = 0.3
+          weights[aboveLevels[2]] = 0.2
+          for (let i = 3; i < aboveLevels.length; i++) weights[aboveLevels[i]] = 0.1 / (aboveLevels.length - 3)
+        }
+
+        for (const lvl of aboveLevels) {
+          const count = Math.max(1, Math.round(tier3Count * (weights[lvl] || 0)))
+          const { data: aboveWords } = await supabase
+            .from('french_vocab')
+            .select('*')
+            .eq('cefr_level', lvl)
+            .eq('is_learned', false)
+            .limit(count * 3)
+
+          if (aboveWords && aboveWords.length > 0) {
+            const shuffled = aboveWords.sort(() => Math.random() - 0.5)
+            const picked = shuffled.filter(v => !hasCardIds.has(v.id) && !existingSourceIds.has(v.id)).slice(0, count)
+
+            for (const vocab of picked) {
+              if (allCards.length >= limit) break
+              const newCard = await createCardFromVocab(vocab)
+              if (newCard) {
+                allCards.push(newCard)
+                existingSourceIds.add(vocab.id)
+              }
+            }
+          }
+          if (allCards.length >= limit) break
+        }
+      }
+    }
+
+    if (allCards.length > 0) {
       vocabCache.current = {}
-      setCards(data)
+      setCards(allCards.slice(0, limit))
       setCurrentIndex(0)
       setRevealed(false)
       setCorrectCount(0)
@@ -119,6 +253,33 @@ export default function Review() {
       setNotesExpanded(false)
       setPhase('reviewing')
     }
+  }
+
+  async function createCardFromVocab(vocab: Record<string, unknown>): Promise<ReviewCard | null> {
+    const { data, error } = await supabase
+      .from('review_cards')
+      .insert({
+        card_type: 'vocab',
+        front: vocab.word,
+        back: vocab.notes || vocab.meaning_cn || vocab.definition || '',
+        source_type: 'french_vocab',
+        source_id: vocab.id,
+        lesson_number: vocab.lesson_number || null,
+        easiness_factor: 2.5,
+        interval_days: 0,
+        repetitions: 0,
+        next_review: new Date().toISOString(),
+        test_mode: 'fr_to_cn',
+        current_stage: 1,
+        phonetic: vocab.ipa || null,
+        emoji: vocab.emoji || null,
+        cefr_level: vocab.cefr_level || null,
+      })
+      .select()
+      .single()
+
+    if (error || !data) return null
+    return data as ReviewCard
   }
 
   const currentCard = cards[currentIndex] ?? null
@@ -433,38 +594,35 @@ export default function Review() {
       <div className="px-4 pt-12 flex flex-col items-center">
         <div className="text-6xl mb-6">📖</div>
         <div className="text-4xl font-bold text-indigo-600 mb-2">{dueCount}</div>
-        <div className="text-gray-500 mb-8">张卡片待复习</div>
+        <div className="text-gray-500 mb-2">张到期卡片</div>
+        <div className="text-xs text-gray-400 mb-8">不足时自动补充新词</div>
 
-        {dueCount > 0 && (
-          <>
-            <div className="flex items-center gap-3 mb-6">
-              <span className="text-sm text-gray-500">数量</span>
-              <div className="flex items-center bg-gray-100 rounded-lg">
-                <button
-                  onClick={() => setLimit((l) => Math.max(5, l - 5))}
-                  className="px-3 py-1.5 text-lg text-gray-600 active:bg-gray-200 rounded-l-lg"
-                >
-                  -
-                </button>
-                <span className="px-4 py-1.5 text-base font-bold text-gray-800 min-w-[40px] text-center">
-                  {Math.min(limit, dueCount)}
-                </span>
-                <button
-                  onClick={() => setLimit((l) => Math.min(dueCount, l + 5))}
-                  className="px-3 py-1.5 text-lg text-gray-600 active:bg-gray-200 rounded-r-lg"
-                >
-                  +
-                </button>
-              </div>
-            </div>
+        <div className="flex items-center gap-3 mb-6">
+          <span className="text-sm text-gray-500">数量</span>
+          <div className="flex items-center bg-gray-100 rounded-lg">
             <button
-              onClick={startSession}
-              className="bg-indigo-600 text-white rounded-xl px-8 py-3 text-lg font-medium active:bg-indigo-700 transition-colors"
+              onClick={() => setLimit((l) => Math.max(5, l - 5))}
+              className="px-3 py-1.5 text-lg text-gray-600 active:bg-gray-200 rounded-l-lg"
             >
-              开始复习
+              -
             </button>
-          </>
-        )}
+            <span className="px-4 py-1.5 text-base font-bold text-gray-800 min-w-[40px] text-center">
+              {limit}
+            </span>
+            <button
+              onClick={() => setLimit((l) => Math.min(100, l + 5))}
+              className="px-3 py-1.5 text-lg text-gray-600 active:bg-gray-200 rounded-r-lg"
+            >
+              +
+            </button>
+          </div>
+        </div>
+        <button
+          onClick={startSession}
+          className="bg-indigo-600 text-white rounded-xl px-8 py-3 text-lg font-medium active:bg-indigo-700 transition-colors mb-6"
+        >
+          开始复习
+        </button>
 
         {dueCount === 0 && (
           <div className="text-center text-gray-400 text-sm mt-4">
