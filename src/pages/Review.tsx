@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { format, addDays } from 'date-fns'
 
@@ -22,6 +22,14 @@ interface ReviewCard {
   cefr_level: string | null
 }
 
+interface SourceVocab {
+  definition?: string
+  ipa?: string
+  notes?: string
+  example_sentences?: string
+  emoji?: string
+}
+
 type Phase = 'start' | 'reviewing' | 'summary'
 
 export default function Review() {
@@ -35,10 +43,50 @@ export default function Review() {
   const [wrongCount, setWrongCount] = useState(0)
   const [wrongList, setWrongList] = useState<ReviewCard[]>([])
   const [loading, setLoading] = useState(true)
+  const [notesExpanded, setNotesExpanded] = useState(false)
+
+  // Cache for source vocab data
+  const vocabCache = useRef<Record<number, SourceVocab>>({})
+  const [currentVocab, setCurrentVocab] = useState<SourceVocab | null>(null)
 
   useEffect(() => {
     loadDueCount()
+    // Preload voices
+    speechSynthesis.getVoices()
   }, [])
+
+  // Fetch source vocab when card changes
+  useEffect(() => {
+    if (!cards[currentIndex]) {
+      setCurrentVocab(null)
+      return
+    }
+    const card = cards[currentIndex]
+    setNotesExpanded(false)
+    if (card.source_type === 'french_vocab' && card.source_id) {
+      fetchSourceVocab(card.source_id)
+    } else {
+      setCurrentVocab(null)
+    }
+  }, [currentIndex, cards])
+
+  async function fetchSourceVocab(sourceId: number) {
+    if (vocabCache.current[sourceId]) {
+      setCurrentVocab(vocabCache.current[sourceId])
+      return
+    }
+    const { data } = await supabase
+      .from('french_vocab')
+      .select('definition, ipa, notes, example_sentences, emoji')
+      .eq('id', sourceId)
+      .maybeSingle()
+    if (data) {
+      vocabCache.current[sourceId] = data
+      setCurrentVocab(data)
+    } else {
+      setCurrentVocab(null)
+    }
+  }
 
   async function loadDueCount() {
     setLoading(true)
@@ -61,12 +109,14 @@ export default function Review() {
       .limit(limit)
 
     if (data && data.length > 0) {
+      vocabCache.current = {}
       setCards(data)
       setCurrentIndex(0)
       setRevealed(false)
       setCorrectCount(0)
       setWrongCount(0)
       setWrongList([])
+      setNotesExpanded(false)
       setPhase('reviewing')
     }
   }
@@ -182,14 +232,61 @@ export default function Review() {
     }
   }
 
-  function speakFrench(text: string) {
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = 'fr-FR'
-    utterance.rate = 0.85
+  const speak = (text: string) => {
+    const u = new SpeechSynthesisUtterance(text)
+    u.lang = 'fr-FR'
+    u.rate = 0.85
     const voices = speechSynthesis.getVoices()
-    const frenchVoice = voices.find((v) => v.lang.startsWith('fr'))
-    if (frenchVoice) utterance.voice = frenchVoice
-    speechSynthesis.speak(utterance)
+    const frVoice = voices.find(v => v.lang === 'fr-FR' && v.localService) || voices.find(v => v.lang.startsWith('fr'))
+    if (frVoice) u.voice = frVoice
+    speechSynthesis.speak(u)
+  }
+
+  function SpeakButton({ text, size = 'sm' }: { text: string; size?: 'sm' | 'lg' }) {
+    return (
+      <button
+        onClick={(e) => {
+          e.stopPropagation()
+          speak(text)
+        }}
+        className={`inline-flex items-center justify-center active:scale-90 transition-transform opacity-60 hover:opacity-100 ${
+          size === 'lg' ? 'text-4xl' : 'text-base ml-1.5'
+        }`}
+        aria-label="播放发音"
+      >
+        🔊
+      </button>
+    )
+  }
+
+  // Get the phonetic/IPA to display: prefer source vocab IPA, fall back to card phonetic
+  function getPhonetic(): string | null {
+    if (currentVocab?.ipa) return currentVocab.ipa
+    if (currentCard?.phonetic) return currentCard.phonetic
+    return null
+  }
+
+  // Get definition: prefer source vocab definition, fall back to card back
+  function getDefinition(): string {
+    if (currentVocab?.definition) return currentVocab.definition
+    return currentCard?.back ?? ''
+  }
+
+  // Get notes content
+  function getNotes(): string | null {
+    if (currentVocab?.notes) return currentVocab.notes
+    // If the definition came from source vocab, the card's back might have extra info
+    if (currentVocab?.definition && currentCard?.back && currentCard.back !== currentVocab.definition) {
+      return currentCard.back
+    }
+    return null
+  }
+
+  // Get emoji from source vocab or card
+  function getEmoji(): string | null {
+    if (currentVocab?.emoji) return currentVocab.emoji
+    if (currentCard?.emoji) return currentCard.emoji
+    return null
   }
 
   function renderFront() {
@@ -200,7 +297,7 @@ export default function Review() {
       return (
         <div className="text-center">
           <button
-            onClick={() => speakFrench(currentCard.front)}
+            onClick={() => speak(currentCard.front)}
             className="text-6xl mb-4 active:scale-95 transition-transform"
           >
             🔊
@@ -211,22 +308,62 @@ export default function Review() {
     }
 
     if (mode === 'cn_to_fr') {
+      const emoji = getEmoji()
       return (
         <div className="text-center">
           <div className="text-sm text-gray-400 mb-2">中 → 法</div>
-          <div className="text-2xl font-bold text-gray-800">{currentCard.back}</div>
+          {emoji ? (
+            <div className="text-4xl">{emoji}</div>
+          ) : (
+            <div className="text-2xl font-bold text-gray-800">{currentCard.back}</div>
+          )}
         </div>
       )
     }
 
     // fr_to_cn (default)
+    const phonetic = getPhonetic()
     return (
       <div className="text-center">
         <div className="text-sm text-gray-400 mb-2">法 → 中</div>
-        {currentCard.emoji && <div className="text-3xl mb-2">{currentCard.emoji}</div>}
-        <div className="text-3xl font-bold text-gray-800">{currentCard.front}</div>
-        {currentCard.phonetic && (
-          <div className="text-sm text-gray-400 mt-1">{currentCard.phonetic}</div>
+        {getEmoji() && <div className="text-3xl mb-2">{getEmoji()}</div>}
+        <div className="flex items-center justify-center">
+          <span className="text-3xl font-bold text-gray-800">{currentCard.front}</span>
+          <SpeakButton text={currentCard.front} />
+        </div>
+        {phonetic && (
+          <div className="text-sm text-gray-400 mt-1">{phonetic}</div>
+        )}
+      </div>
+    )
+  }
+
+  function renderNotesSection(notes: string | null, definition: string) {
+    // If there's no definition but there are notes, show notes expanded
+    const hasDefinition = !!definition
+    const hasNotes = !!notes
+    if (!hasNotes) return null
+
+    const shouldDefaultExpand = !hasDefinition
+    const isExpanded = shouldDefaultExpand || notesExpanded
+
+    return (
+      <div className="mt-3 w-full">
+        {!shouldDefaultExpand && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              setNotesExpanded(!notesExpanded)
+            }}
+            className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+          >
+            {notesExpanded ? '收起备注 ▲' : '展开备注 ▼'}
+          </button>
+        )}
+        {isExpanded && (
+          <div className="mt-1 text-sm text-gray-500 bg-gray-100 rounded-lg px-3 py-2 text-left whitespace-pre-wrap">
+            {notes}
+          </div>
         )}
       </div>
     )
@@ -235,48 +372,49 @@ export default function Review() {
   function renderBack() {
     if (!currentCard) return null
     const mode = currentCard.test_mode
+    const phonetic = getPhonetic()
+    const definition = getDefinition()
+    const notes = getNotes()
 
     if (mode === 'cn_to_fr') {
       return (
-        <div className="text-center mt-4 pt-4 border-t border-gray-100">
-          {currentCard.emoji && <div className="text-2xl mb-1">{currentCard.emoji}</div>}
-          <div className="text-2xl font-bold text-indigo-600">{currentCard.front}</div>
-          {currentCard.phonetic && (
-            <div className="text-sm text-gray-400 mt-1">{currentCard.phonetic}</div>
+        <div className="text-center mt-4 pt-4 border-t border-gray-100 w-full">
+          {getEmoji() && <div className="text-2xl mb-1">{getEmoji()}</div>}
+          <div className="flex items-center justify-center">
+            <span className="text-2xl font-bold text-indigo-600">{currentCard.front}</span>
+            <SpeakButton text={currentCard.front} />
+          </div>
+          {phonetic && (
+            <div className="text-sm text-gray-400 mt-1">{phonetic}</div>
           )}
-          <button
-            onClick={() => speakFrench(currentCard.front)}
-            className="mt-2 text-2xl active:scale-95"
-          >
-            🔊
-          </button>
+          <div className="text-base text-gray-600 mt-2">{definition}</div>
+          {renderNotesSection(notes, definition)}
         </div>
       )
     }
 
     if (mode === 'listen') {
       return (
-        <div className="text-center mt-4 pt-4 border-t border-gray-100">
-          {currentCard.emoji && <div className="text-2xl mb-1">{currentCard.emoji}</div>}
-          <div className="text-2xl font-bold text-indigo-600">{currentCard.front}</div>
-          {currentCard.phonetic && (
-            <div className="text-sm text-gray-400 mt-1">{currentCard.phonetic}</div>
+        <div className="text-center mt-4 pt-4 border-t border-gray-100 w-full">
+          {getEmoji() && <div className="text-2xl mb-1">{getEmoji()}</div>}
+          <div className="flex items-center justify-center">
+            <span className="text-2xl font-bold text-indigo-600">{currentCard.front}</span>
+            <SpeakButton text={currentCard.front} />
+          </div>
+          {phonetic && (
+            <div className="text-sm text-gray-400 mt-1">{phonetic}</div>
           )}
-          <div className="text-base text-gray-600 mt-2">{currentCard.back}</div>
+          <div className="text-base text-gray-600 mt-2">{definition}</div>
+          {renderNotesSection(notes, definition)}
         </div>
       )
     }
 
     // fr_to_cn
     return (
-      <div className="text-center mt-4 pt-4 border-t border-gray-100">
-        <div className="text-xl font-bold text-indigo-600">{currentCard.back}</div>
-        <button
-          onClick={() => speakFrench(currentCard.front)}
-          className="mt-2 text-2xl active:scale-95"
-        >
-          🔊
-        </button>
+      <div className="text-center mt-4 pt-4 border-t border-gray-100 w-full">
+        <div className="text-xl font-bold text-indigo-600">{definition}</div>
+        {renderNotesSection(notes, definition)}
       </div>
     )
   }

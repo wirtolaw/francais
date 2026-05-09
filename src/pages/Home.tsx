@@ -140,31 +140,33 @@ export default function Home() {
     const levels = ['A1', 'A2', 'B1', 'B2']
     const results: CefrProgress[] = []
 
-    // Get vocab counts per level
-    const { data: vocabCounts } = await supabase
-      .from('french_vocab')
-      .select('cefr_level')
+    // Get target vocab counts per CEFR level from tcf_vocab_target
+    const { data: targetCounts } = await supabase
+      .from('tcf_vocab_target')
+      .select('cefr_level, is_learned')
 
-    // Get review cards with interval info
+    // Get review cards with interval info for mastered count
     const { data: reviewCards } = await supabase
       .from('review_cards')
       .select('source_id, interval_days, cefr_level')
       .eq('card_type', 'vocab')
 
-    const vocabByLevel = new Map<string, number>()
-    if (vocabCounts) {
-      for (const v of vocabCounts) {
-        const lvl = v.cefr_level ?? 'A1'
-        vocabByLevel.set(lvl, (vocabByLevel.get(lvl) ?? 0) + 1)
+    const totalByLevel = new Map<string, number>()
+    const learnedByLevel = new Map<string, number>()
+    if (targetCounts) {
+      for (const t of targetCounts) {
+        const lvl = t.cefr_level ?? 'A1'
+        totalByLevel.set(lvl, (totalByLevel.get(lvl) ?? 0) + 1)
+        if (t.is_learned) {
+          learnedByLevel.set(lvl, (learnedByLevel.get(lvl) ?? 0) + 1)
+        }
       }
     }
 
-    const learnedByLevel = new Map<string, number>()
     const masteredByLevel = new Map<string, number>()
     if (reviewCards) {
       for (const c of reviewCards) {
         const lvl = c.cefr_level ?? 'A1'
-        learnedByLevel.set(lvl, (learnedByLevel.get(lvl) ?? 0) + 1)
         if (c.interval_days >= 14) {
           masteredByLevel.set(lvl, (masteredByLevel.get(lvl) ?? 0) + 1)
         }
@@ -172,10 +174,9 @@ export default function Home() {
     }
 
     for (const level of levels) {
-      const total = vocabByLevel.get(level) ?? 0
       results.push({
         level,
-        total,
+        total: totalByLevel.get(level) ?? 0,
         learned: learnedByLevel.get(level) ?? 0,
         mastered: masteredByLevel.get(level) ?? 0,
       })
