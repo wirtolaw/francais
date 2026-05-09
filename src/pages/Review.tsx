@@ -53,7 +53,8 @@ function getStage(intervalDays: number): number {
   return 1
 }
 
-function getQuestionType(testMode: string, intervalDays: number): QuestionType {
+function getQuestionType(testMode: string, intervalDays: number, cardType?: string): QuestionType {
+  if (cardType === 'rule') return 'self_judge'
   const stage = getStage(intervalDays)
 
   if (testMode === 'fr_to_cn') {
@@ -118,6 +119,12 @@ export default function Review() {
   const [fillBlankAnswer, setFillBlankAnswer] = useState<string>('')
   const [selfJudgeRevealed, setSelfJudgeRevealed] = useState(false)
 
+  // Listen mode sentence upgrade (Task 22)
+  const [listenSentence, setListenSentence] = useState<{ fr: string; translation: string } | null>(null)
+
+  // Confusable groups cache (Task 24)
+  const confusableGroups = useRef<{ id: number; words: string[]; confusion_type: string; note: string | null }[]>([])
+
   useEffect(() => {
     loadDueCount()
     speechSynthesis.getVoices()
@@ -138,9 +145,28 @@ export default function Review() {
     setFillBlankSentence(null)
     setFillBlankAnswer('')
     setSelfJudgeRevealed(false)
+    setListenSentence(null)
 
     if (card.source_type === 'french_vocab' && card.source_id) {
       fetchSourceVocab(card.source_id).then((vocab) => {
+        // Listen mode sentence upgrade: if interval >= 21 and has example_sentences, pick one
+        if (card.test_mode === 'listen' && card.interval_days >= 21 && vocab?.example_sentences) {
+          try {
+            const sentences = typeof vocab.example_sentences === 'string'
+              ? JSON.parse(vocab.example_sentences)
+              : vocab.example_sentences
+            if (Array.isArray(sentences) && sentences.length > 0) {
+              const s = sentences[Math.floor(Math.random() * sentences.length)]
+              const fr = s.fr || s.french || ''
+              const translation = s.cn || s.zh || s.chinese || s.translation || s.en || ''
+              if (fr) {
+                setListenSentence({ fr, translation })
+              }
+            }
+          } catch {
+            // fall through, keep single-word mode
+          }
+        }
         setupQuestion(card, vocab)
       })
     } else {
@@ -153,11 +179,13 @@ export default function Review() {
   useEffect(() => {
     if (!cards[currentIndex]) return
     const card = cards[currentIndex]
-    if (card.test_mode === 'listen' && !answered) {
-      const timer = setTimeout(() => speak(card.front), 300)
+    if (card.test_mode === 'listen' && card.card_type !== 'rule' && !answered) {
+      // Use sentence TTS if available (listen mode upgrade)
+      const textToSpeak = listenSentence ? listenSentence.fr : card.front
+      const timer = setTimeout(() => speak(textToSpeak), 300)
       return () => clearTimeout(timer)
     }
-  }, [currentIndex, cards])
+  }, [currentIndex, cards, listenSentence])
 
   async function fetchSourceVocab(sourceId: number): Promise<SourceVocab | null> {
     if (vocabCache.current[sourceId]) {
@@ -179,7 +207,7 @@ export default function Review() {
   }
 
   function setupQuestion(card: ReviewCard, vocab: SourceVocab | null) {
-    const qType = getQuestionType(card.test_mode, card.interval_days)
+    const qType = getQuestionType(card.test_mode, card.interval_days, card.card_type)
 
     if (qType === 'multiple_choice') {
       generateChoices(card, vocab)
@@ -188,39 +216,66 @@ export default function Review() {
     }
   }
 
+  function getConfusableWords(word: string): string[] {
+    for (const group of confusableGroups.current) {
+      if (group.words.includes(word)) {
+        return group.words.filter(w => w !== word)
+      }
+    }
+    return []
+  }
+
   function generateChoices(card: ReviewCard, vocab: SourceVocab | null) {
     const mode = card.test_mode
     const pool = distractorPool.current
+    const confusables = getConfusableWords(card.front)
 
     if (mode === 'fr_to_cn') {
       // Correct answer is definition
       const correctDef = vocab?.definition || card.back || ''
+
+      // Priority distractors from confusable groups (look up their definitions)
+      const confusableDistractors: string[] = []
+      for (const cw of confusables) {
+        if (confusableDistractors.length >= 3) break
+        const found = pool.find(d => d.word === cw && d.definition !== correctDef)
+        if (found) confusableDistractors.push(found.definition)
+      }
+      const remaining = 3 - confusableDistractors.length
+
       // Get distractors: prefer same cefr_level
-      const sameLevelPool = pool.filter(d => d.cefr_level === card.cefr_level && d.definition !== correctDef && d.id !== card.source_id)
-      const otherPool = pool.filter(d => d.cefr_level !== card.cefr_level && d.definition !== correctDef && d.id !== card.source_id)
-      const candidates = sameLevelPool.length >= 3
-        ? shuffleArray(sameLevelPool).slice(0, 3)
-        : [...shuffleArray(sameLevelPool), ...shuffleArray(otherPool)].slice(0, 3)
-      const distractorDefs = candidates.map(c => c.definition)
+      const usedDefs = new Set([correctDef, ...confusableDistractors])
+      const sameLevelPool = pool.filter(d => d.cefr_level === card.cefr_level && !usedDefs.has(d.definition) && d.id !== card.source_id)
+      const otherPool = pool.filter(d => d.cefr_level !== card.cefr_level && !usedDefs.has(d.definition) && d.id !== card.source_id)
+      const fillCandidates = sameLevelPool.length >= remaining
+        ? shuffleArray(sameLevelPool).slice(0, remaining)
+        : [...shuffleArray(sameLevelPool), ...shuffleArray(otherPool)].slice(0, remaining)
+      const distractorDefs = [...confusableDistractors, ...fillCandidates.map(c => c.definition)]
       setChoices(shuffleArray([correctDef, ...distractorDefs]))
     } else {
       // cn_to_fr or listen: 4 French word options
       const correctWord = card.front
+
+      // Priority distractors from confusable groups
+      const confusableDistractors = confusables.slice(0, 3)
+      const remaining = 3 - confusableDistractors.length
+      const usedWords = new Set([correctWord, ...confusableDistractors])
+
       let preferred: DistractorVocab[]
       if (mode === 'listen') {
         // Prefer same first letter
         const firstLetter = correctWord[0]?.toLowerCase()
-        preferred = pool.filter(d => d.word !== correctWord && d.id !== card.source_id && d.word[0]?.toLowerCase() === firstLetter)
+        preferred = pool.filter(d => !usedWords.has(d.word) && d.id !== card.source_id && d.word[0]?.toLowerCase() === firstLetter)
       } else {
         // Prefer same cefr_level and similar length
-        preferred = pool.filter(d => d.word !== correctWord && d.id !== card.source_id && d.cefr_level === card.cefr_level)
+        preferred = pool.filter(d => !usedWords.has(d.word) && d.id !== card.source_id && d.cefr_level === card.cefr_level)
         preferred.sort((a, b) => Math.abs(a.word.length - correctWord.length) - Math.abs(b.word.length - correctWord.length))
       }
-      const fallback = pool.filter(d => d.word !== correctWord && d.id !== card.source_id && !preferred.includes(d))
-      const candidates = preferred.length >= 3
-        ? (mode === 'listen' ? shuffleArray(preferred).slice(0, 3) : preferred.slice(0, 3))
-        : [...(mode === 'listen' ? shuffleArray(preferred) : preferred), ...shuffleArray(fallback)].slice(0, 3)
-      setChoices(shuffleArray([correctWord, ...candidates.map(c => c.word)]))
+      const fallback = pool.filter(d => !usedWords.has(d.word) && d.id !== card.source_id && !preferred.includes(d))
+      const fillCandidates = preferred.length >= remaining
+        ? (mode === 'listen' ? shuffleArray(preferred).slice(0, remaining) : preferred.slice(0, remaining))
+        : [...(mode === 'listen' ? shuffleArray(preferred) : preferred), ...shuffleArray(fallback)].slice(0, remaining)
+      setChoices(shuffleArray([correctWord, ...confusableDistractors, ...fillCandidates.map(c => c.word)]))
     }
   }
 
@@ -298,13 +353,21 @@ export default function Review() {
   }
 
   async function fetchDistractorPool() {
-    const { data } = await supabase
-      .from('french_vocab')
-      .select('id, word, definition, cefr_level')
-      .not('definition', 'is', null)
-      .limit(200)
-    if (data) {
-      distractorPool.current = shuffleArray(data as DistractorVocab[])
+    const [vocabResult, confusableResult] = await Promise.all([
+      supabase
+        .from('french_vocab')
+        .select('id, word, definition, cefr_level')
+        .not('definition', 'is', null)
+        .limit(200),
+      supabase
+        .from('confusable_groups')
+        .select('id, words, confusion_type, note'),
+    ])
+    if (vocabResult.data) {
+      distractorPool.current = shuffleArray(vocabResult.data as DistractorVocab[])
+    }
+    if (confusableResult.data) {
+      confusableGroups.current = confusableResult.data
     }
   }
 
@@ -315,6 +378,33 @@ export default function Review() {
 
     // Fetch distractor pool in parallel with cards
     await fetchDistractorPool()
+
+    // Check for weak review mode via URL param
+    const urlParams = new URLSearchParams(window.location.hash.split('?')[1] || '')
+    const isWeakMode = urlParams.get('weak') === '1'
+
+    if (isWeakMode) {
+      const { data: weakCards } = await supabase
+        .from('review_cards')
+        .select('*')
+        .gt('repetitions', 0)
+        .order('easiness_factor', { ascending: true })
+        .limit(10)
+      if (weakCards && weakCards.length > 0) {
+        const finalCards = weakCards as ReviewCard[]
+        newCardIds.current = new Set()
+        vocabCache.current = {}
+        setCards(finalCards)
+        setCurrentIndex(0)
+        setCorrectCount(0)
+        setWrongCount(0)
+        setWrongList([])
+        setPhase('reviewing')
+        setSessionStarting(false)
+        return
+      }
+      // If no weak cards found, fall through to normal session
+    }
 
     // === Tier 1: Due review cards ===
     const { data: dueCards } = await supabase
@@ -497,7 +587,7 @@ export default function Review() {
         repetitions: newReps,
         next_review: nextReview.toISOString(),
         last_reviewed: now.toISOString(),
-        test_mode: getNextTestMode(currentCard.test_mode),
+        test_mode: currentCard.card_type === 'rule' ? currentCard.test_mode : getNextTestMode(currentCard.test_mode),
       })
       .eq('id', currentCard.id)
 
@@ -688,18 +778,40 @@ export default function Review() {
   function renderPrompt() {
     if (!currentCard) return null
     const mode = currentCard.test_mode
-    const qType = getQuestionType(mode, currentCard.interval_days)
+    const qType = getQuestionType(mode, currentCard.interval_days, currentCard.card_type)
+
+    // Rule (grammar) cards: show front text
+    if (currentCard.card_type === 'rule') {
+      return (
+        <div className="text-center">
+          <div className="text-lg text-gray-800 leading-relaxed whitespace-pre-wrap">{currentCard.front}</div>
+        </div>
+      )
+    }
 
     if (mode === 'listen') {
+      const isSentenceMode = !!listenSentence
+      const textToSpeak = isSentenceMode ? listenSentence!.fr : currentCard.front
       return (
         <div className="text-center">
           <button
-            onClick={() => speak(currentCard.front)}
+            onClick={() => speak(textToSpeak)}
             className="text-6xl mb-4 active:scale-95 transition-transform"
           >
             🔊
           </button>
-          <div className="text-sm text-gray-400">听发音，选择正确答案</div>
+          <div className="text-sm text-gray-400">
+            {isSentenceMode ? '听句子，识别目标单词' : '听发音，选择正确答案'}
+          </div>
+          {/* Show sentence + translation after answering in sentence mode */}
+          {isSentenceMode && answered && (
+            <div className="mt-3 bg-indigo-50 rounded-lg p-3 text-left">
+              <div className="text-sm font-medium text-gray-800">{listenSentence!.fr}</div>
+              {listenSentence!.translation && (
+                <div className="text-xs text-gray-500 mt-1">{listenSentence!.translation}</div>
+              )}
+            </div>
+          )}
         </div>
       )
     }
@@ -747,7 +859,7 @@ export default function Review() {
   function renderInteraction() {
     if (!currentCard) return null
     const mode = currentCard.test_mode
-    const qType = getQuestionType(mode, currentCard.interval_days)
+    const qType = getQuestionType(mode, currentCard.interval_days, currentCard.card_type)
 
     // Fill-in-blank with no sentence falls back
     const effectiveQType = (qType === 'fill_blank' && !fillBlankSentence)
@@ -805,8 +917,9 @@ export default function Review() {
 
   function renderSelfJudge() {
     if (!currentCard) return null
-    const phonetic = getPhonetic()
-    const definition = getDefinition()
+    const isRule = currentCard.card_type === 'rule'
+    const phonetic = isRule ? null : getPhonetic()
+    const definition = isRule ? currentCard.back : getDefinition()
 
     if (!selfJudgeRevealed) {
       return (
