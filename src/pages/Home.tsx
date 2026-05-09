@@ -565,7 +565,26 @@ export default function Home() {
                     <div style={{ background: '#fff7ed', borderRadius: '0 0 8px 8px', padding: '8px 12px', fontSize: 12, color: '#4b5563' }}>
                       {card.vocab.ipa && <div style={{ marginBottom: 4 }}>IPA: {card.vocab.ipa}</div>}
                       {card.vocab.notes && <div style={{ marginBottom: 4 }}>笔记: {card.vocab.notes}</div>}
-                      {card.vocab.example_sentences && <div>例句: {card.vocab.example_sentences}</div>}
+                      {card.vocab.example_sentences && (() => {
+                        try {
+                          const sentences: { fr: string; translation: string }[] =
+                            typeof card.vocab.example_sentences === 'string'
+                              ? JSON.parse(card.vocab.example_sentences)
+                              : card.vocab.example_sentences
+                          if (!Array.isArray(sentences) || sentences.length === 0) return null
+                          return (
+                            <div>
+                              <div style={{ marginBottom: 4, fontWeight: 600 }}>例句</div>
+                              {sentences.map((s, i) => (
+                                <div key={i} style={{ marginBottom: i < sentences.length - 1 ? 8 : 0 }}>
+                                  <div style={{ fontStyle: 'italic' }}>{s.fr}</div>
+                                  <div style={{ color: '#9ca3af' }}>— {s.translation}</div>
+                                </div>
+                              ))}
+                            </div>
+                          )
+                        } catch { return null }
+                      })()}
                     </div>
                   )}
                 </div>
