@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#F0F6FC"/>
+      <stop offset="100%" style="stop-color:#FDF4F4"/>
+    </linearGradient>
+    <linearGradient id="petalCenter" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#6AAAD4"/>
+      <stop offset="100%" style="stop-color:#8BBCE0"/>
+    </linearGradient>
+    <linearGradient id="petalSide" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#88BCD8"/>
+      <stop offset="100%" style="stop-color:#A8D0E8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <clipPath id="roundClip">
+    <rect width="512" height="512" rx="112"/>
+  </clipPath>
+  <g clip-path="url(#roundClip)">
+    <path d="M0,380 Q80,355 160,380 Q240,405 320,380 Q400,355 512,380 L512,512 L0,512 Z" fill="#8BB8E8" opacity="0.18"/>
+    <path d="M0,400 Q90,375 180,400 Q270,425 360,400 Q440,375 512,400 L512,512 L0,512 Z" fill="#EAD8D8" opacity="0.2"/>
+    <path d="M0,420 Q100,395 200,420 Q300,445 400,420 Q480,395 512,420 L512,512 L0,512 Z" fill="#E8A8A8" opacity="0.18"/>
+  </g>
+
+  <g transform="translate(256, 310) scale(1.7)">
+    <path d="M0,-120 C-4,-110 -12,-85 -14,-60 C-16,-35 -13,-15 -8,0 C-4,10 -2,15 0,18 C2,15 4,10 8,0 C13,-15 16,-35 14,-60 C12,-85 4,-110 0,-120 Z" fill="url(#petalCenter)" opacity="0.6"/>
+    <ellipse cx="0" cy="-124" rx="8" ry="10" fill="#6AAAD4" opacity="0.6"/>
+    <path d="M0,-110 C-2,-80 -3,-40 0,10" fill="none" stroke="white" stroke-width="1.2" opacity="0.3"/>
+    <path d="M-12,0 C-18,-8 -35,-25 -55,-42 C-75,-58 -92,-72 -100,-82 C-108,-92 -105,-100 -96,-100 C-87,-100 -72,-90 -58,-75 C-44,-60 -30,-38 -20,-20 C-14,-8 -12,0 -10,5 Z" fill="url(#petalSide)" opacity="0.5"/>
+    <ellipse cx="-99" cy="-103" rx="9" ry="8" fill="#88BCD8" opacity="0.5" transform="rotate(-30, -99, -103)"/>
+    <path d="M-14,-2 C-30,-22 -55,-50 -85,-82" fill="none" stroke="white" stroke-width="1" opacity="0.25"/>
+    <path d="M12,0 C18,-8 35,-25 55,-42 C75,-58 92,-72 100,-82 C108,-92 105,-100 96,-100 C87,-100 72,-90 58,-75 C44,-60 30,-38 20,-20 C14,-8 12,0 10,5 Z" fill="url(#petalSide)" opacity="0.5"/>
+    <ellipse cx="99" cy="-103" rx="9" ry="8" fill="#88BCD8" opacity="0.5" transform="rotate(30, 99, -103)"/>
+    <path d="M14,-2 C30,-22 55,-50 85,-82" fill="none" stroke="white" stroke-width="1" opacity="0.25"/>
+    <path d="M-22,5 Q-15,12 0,14 Q15,12 22,5 Q15,0 0,-2 Q-15,0 -22,5 Z" fill="#C8A8B0" opacity="0.35"/>
+    <circle cx="-15" cy="-5" r="2.5" fill="#7BAED4" opacity="0.3"/>
+    <circle cx="15" cy="-5" r="2.5" fill="#7BAED4" opacity="0.3"/>
+    <circle cx="0" cy="-8" r="2" fill="#7BAED4" opacity="0.25"/>
+    <path d="M0,-100 C-3,-75 -5,-45 0,0" fill="none" stroke="white" stroke-width="2" opacity="0.15"/>
+  </g>
+</svg>
