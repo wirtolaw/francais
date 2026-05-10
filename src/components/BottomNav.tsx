@@ -11,20 +11,20 @@ export default function BottomNav() {
   const navigate = useNavigate()
 
   return (
-    <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[430px] bg-white border-t border-gray-200 z-50">
-      <div className="flex justify-around items-center h-14">
+    <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[430px] bg-white border-t border-gray-200 z-50 pb-[env(safe-area-inset-bottom)]">
+      <div className="flex justify-around items-center h-16">
         {tabs.map((tab) => {
           const isActive = location.pathname === tab.path
           return (
             <button
               key={tab.path}
               onClick={() => navigate(tab.path)}
-              className={`flex flex-col items-center justify-center flex-1 h-full transition-colors ${
+              className={`flex flex-col items-center justify-center flex-1 h-full min-h-[56px] transition-colors ${
                 isActive ? 'text-indigo-600' : 'text-gray-400'
               }`}
             >
-              <span className="text-lg">{tab.icon}</span>
-              <span className="text-xs mt-0.5 font-medium">{tab.label}</span>
+              <span className="text-2xl">{tab.icon}</span>
+              <span className="text-sm mt-1 font-medium">{tab.label}</span>
             </button>
           )
         })}
